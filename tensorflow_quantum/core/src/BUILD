@@ -6,6 +6,31 @@ licenses(["notice"])
 exports_files(["__init__.py"])
 
 cc_library(
+    name = "adj_util",
+    srcs = ["adj_util.cc"],
+    hdrs = ["adj_util.h"],
+    deps = [
+        "@qsim//lib:circuit",
+        "@qsim//lib:gates_cirq",
+        "@qsim//lib:fuser",
+        "@qsim//lib:fuser_basic",
+        "@qsim//lib:io",
+        "@qsim//lib:matrix",
+    ],
+)
+
+cc_test(
+    name = "adj_util_test",
+    srcs = ["adj_util_test.cc"],
+    deps = [
+        ":adj_util",
+        "@qsim//lib:gates_cirq",
+        "@qsim//lib:matrix",
+        "@com_google_googletest//:gtest_main",
+    ]
+)
+
+cc_library(
     name = "circuit",
     srcs = ["circuit.cc"],
     hdrs = ["circuit.h"],
@@ -45,6 +70,7 @@ cc_library(
     srcs = ["circuit_parser_qsim.cc"],
     hdrs = ["circuit_parser_qsim.h"],
     deps = [
+        ":adj_util",
         "//tensorflow_quantum/core/proto:pauli_sum_cc_proto",
         "//tensorflow_quantum/core/proto:program_cc_proto",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -54,7 +80,7 @@ cc_library(
         "@qsim//lib:gates_cirq",
         "@qsim//lib:fuser",
         "@qsim//lib:fuser_basic",
-        "@qsim//lib:io"  
+        "@qsim//lib:io", 
     ],
 )
 

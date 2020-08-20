@@ -25,9 +25,11 @@ limitations under the License.
 #include "../qsim/lib/io.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/numbers.h"
+#include "absl/types/optional.h"
 #include "cirq/google/api/v2/program.pb.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow_quantum/core/proto/pauli_sum.pb.h"
+#include "tensorflow_quantum/core/src/adj_util.h"
 
 namespace tfq {
 
@@ -43,8 +45,10 @@ typedef absl::flat_hash_map<std::string, std::pair<int, float>> SymbolMap;
 typedef qsim::Cirq::GateCirq<float> QsimGate;
 typedef qsim::Circuit<QsimGate> QsimCircuit;
 
-inline Status ParseProtoArg(const Operation& op, const std::string& arg_name,
-                            const SymbolMap& param_map, float* result) {
+inline Status ParseProtoArg(
+    const Operation& op, const std::string& arg_name,
+    const SymbolMap& param_map, float* result,
+    absl::optional<std::string>* symbol_used = nullptr) {
   // find arg_name in proto.
   // iterator<Map<str, Arg>>
   const auto arg_v = op.args().find(arg_name);
@@ -65,6 +69,9 @@ inline Status ParseProtoArg(const Operation& op, const std::string& arg_name,
           "Could not find symbol in parameter map: " + proto_arg.symbol());
     }
     *result = iter->second.second;
+    if (symbol_used != nullptr) {
+      symbol_used->emplace(iter->first);
+    }
   }
   return Status::OK();
 }
@@ -107,13 +114,15 @@ inline Status SingleEigenGate(
     const std::function<QsimGate(unsigned int, unsigned int, float, float)>&
         create_f,
     const unsigned int num_qubits, const unsigned int time,
-    QsimCircuit* circuit) {
+    QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   unsigned int q0;
   bool unused;
   float exp, exp_s, gs;
   Status u;
   unused = absl::SimpleAtoi(op.qubits(0).id(), &q0);
-  u = ParseProtoArg(op, "exponent", param_map, &exp);
+
+  absl::optional<std::string> exponent_symbol;
+  u = ParseProtoArg(op, "exponent", param_map, &exp, &exponent_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -128,6 +137,15 @@ inline Status SingleEigenGate(
 
   circuit->gates.push_back(
       create_f(time, num_qubits - q0 - 1, exp * exp_s, gs));
+
+  // check for symbols and track gradients if needed.
+  if (grad_indices != nullptr && exponent_symbol.has_value()) {
+    GradientOfGate grad;
+    PopulateGradientSingleEigen(create_f, exponent_symbol.value(),
+                                circuit->gates.size() - 1, num_qubits - q0 - 1,
+                                exp, exp_s, gs, &grad);
+    grad_indices->push_back(grad);
+  }
   return Status::OK();
 }
 
@@ -137,7 +155,7 @@ inline Status TwoEigenGate(
     const std::function<QsimGate(unsigned int, unsigned int, unsigned int,
                                  float, float)>& create_f,
     const unsigned int num_qubits, const unsigned int time,
-    QsimCircuit* circuit) {
+    QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   unsigned int q0, q1;
   float exp, exp_s, gs;
   bool unused;
@@ -145,7 +163,8 @@ inline Status TwoEigenGate(
   unused = absl::SimpleAtoi(op.qubits(0).id(), &q0);
   unused = absl::SimpleAtoi(op.qubits(1).id(), &q1);
 
-  u = ParseProtoArg(op, "exponent", param_map, &exp);
+  absl::optional<std::string> exponent_symbol;
+  u = ParseProtoArg(op, "exponent", param_map, &exp, &exponent_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -159,111 +178,124 @@ inline Status TwoEigenGate(
   }
   circuit->gates.push_back(create_f(time, num_qubits - q0 - 1,
                                     num_qubits - q1 - 1, exp * exp_s, gs));
+
+  // check for symbols and track gradients if needed.
+  if (grad_indices != nullptr && exponent_symbol.has_value()) {
+    GradientOfGate grad;
+    PopulateGradientTwoEigen(create_f, exponent_symbol.value(),
+                             circuit->gates.size() - 1, num_qubits - q0 - 1,
+                             num_qubits - q1 - 1, exp, exp_s, gs, &grad);
+    grad_indices->push_back(grad);
+  }
   return Status::OK();
 }
 
 Status IGate(const Operation& op, const SymbolMap& param_map,
              const unsigned int num_qubits, const unsigned int time,
-             QsimCircuit* circuit) {
+             QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return SingleConstantGate(op, param_map, &qsim::Cirq::I<float>::Create,
                             num_qubits, time, circuit);
 }
 
 Status I2Gate(const Operation& op, const SymbolMap& param_map,
               const unsigned int num_qubits, const unsigned int time,
-              QsimCircuit* circuit) {
+              QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return TwoConstantGate(op, param_map, &qsim::Cirq::I2<float>::Create,
                          num_qubits, time, circuit);
 }
 
 Status HGate(const Operation& op, const SymbolMap& param_map,
              const unsigned int num_qubits, const unsigned int time,
-             QsimCircuit* circuit) {
+             QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return SingleEigenGate(op, param_map, &qsim::Cirq::HPowGate<float>::Create,
-                         num_qubits, time, circuit);
+                         num_qubits, time, circuit, grad_indices);
 }
 
 Status XGate(const Operation& op, const SymbolMap& param_map,
              const unsigned int num_qubits, const unsigned int time,
-             QsimCircuit* circuit) {
+             QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return SingleEigenGate(op, param_map, &qsim::Cirq::XPowGate<float>::Create,
-                         num_qubits, time, circuit);
+                         num_qubits, time, circuit, grad_indices);
 }
 
 Status XXGate(const Operation& op, const SymbolMap& param_map,
               const unsigned int num_qubits, const unsigned int time,
-              QsimCircuit* circuit) {
+              QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::XXPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 Status YGate(const Operation& op, const SymbolMap& param_map,
              const unsigned int num_qubits, const unsigned int time,
-             QsimCircuit* circuit) {
+             QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return SingleEigenGate(op, param_map, &qsim::Cirq::YPowGate<float>::Create,
-                         num_qubits, time, circuit);
+                         num_qubits, time, circuit, grad_indices);
 }
 
 Status YYGate(const Operation& op, const SymbolMap& param_map,
               const unsigned int num_qubits, const unsigned int time,
-              QsimCircuit* circuit) {
+              QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::YYPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 Status ZGate(const Operation& op, const SymbolMap& param_map,
              const unsigned int num_qubits, const unsigned int time,
-             QsimCircuit* circuit) {
+             QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return SingleEigenGate(op, param_map, &qsim::Cirq::ZPowGate<float>::Create,
-                         num_qubits, time, circuit);
+                         num_qubits, time, circuit, grad_indices);
 }
 
 Status ZZGate(const Operation& op, const SymbolMap& param_map,
               const unsigned int num_qubits, const unsigned int time,
-              QsimCircuit* circuit) {
+              QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::ZZPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 Status CZGate(const Operation& op, const SymbolMap& param_map,
               const unsigned int num_qubits, const unsigned int time,
-              QsimCircuit* circuit) {
+              QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::CZPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 Status CXGate(const Operation& op, const SymbolMap& param_map,
               const unsigned int num_qubits, const unsigned int time,
-              QsimCircuit* circuit) {
+              QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::CXPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 Status SwapGate(const Operation& op, const SymbolMap& param_map,
                 const unsigned int num_qubits, const unsigned int time,
-                QsimCircuit* circuit) {
+                QsimCircuit* circuit,
+                std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::SwapPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 Status ISwapGate(const Operation& op, const SymbolMap& param_map,
                  const unsigned int num_qubits, const unsigned int time,
-                 QsimCircuit* circuit) {
+                 QsimCircuit* circuit,
+                 std::vector<GradientOfGate>* grad_indices) {
   return TwoEigenGate(op, param_map, &qsim::Cirq::ISwapPowGate<float>::Create,
-                      num_qubits, time, circuit);
+                      num_qubits, time, circuit, grad_indices);
 }
 
 // single qubit PhasedXPow -> Create(time, q0, pexp, exp, gs)
 inline Status PhasedXGate(const Operation& op, const SymbolMap& param_map,
                           const unsigned int num_qubits,
-                          const unsigned int time, QsimCircuit* circuit) {
+                          const unsigned int time, QsimCircuit* circuit,
+                          std::vector<GradientOfGate>* grad_indices) {
   int q0;
   bool unused;
   float pexp, pexp_s, exp, exp_s, gs;
   Status u;
   unused = absl::SimpleAtoi(op.qubits(0).id(), &q0);
 
-  u = ParseProtoArg(op, "exponent", param_map, &exp);
+  absl::optional<std::string> exponent_symbol;
+  u = ParseProtoArg(op, "exponent", param_map, &exp, &exponent_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -271,7 +303,9 @@ inline Status PhasedXGate(const Operation& op, const SymbolMap& param_map,
   if (!u.ok()) {
     return u;
   }
-  u = ParseProtoArg(op, "phase_exponent", param_map, &pexp);
+  absl::optional<std::string> phase_exponent_symbol;
+  u = ParseProtoArg(op, "phase_exponent", param_map, &pexp,
+                    &phase_exponent_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -285,20 +319,40 @@ inline Status PhasedXGate(const Operation& op, const SymbolMap& param_map,
   }
   circuit->gates.push_back(qsim::Cirq::PhasedXPowGate<float>::Create(
       time, num_qubits - q0 - 1, pexp * pexp_s, exp * exp_s, gs));
+
+  // check for symbols and track gradients if needed.
+  if (grad_indices != nullptr &&
+      (phase_exponent_symbol.has_value() || exponent_symbol.has_value())) {
+    GradientOfGate grad;
+    if (phase_exponent_symbol.has_value()) {
+      PopulateGradientPhasedXPhasedExponent(
+          phase_exponent_symbol.value(), circuit->gates.size() - 1,
+          num_qubits - q0 - 1, pexp, pexp_s, exp, exp_s, gs, &grad);
+    }
+    if (exponent_symbol.has_value()) {
+      PopulateGradientPhasedXExponent(
+          exponent_symbol.value(), circuit->gates.size() - 1,
+          num_qubits - q0 - 1, pexp, pexp_s, exp, exp_s, gs, &grad);
+    }
+    grad_indices->push_back(grad);
+  }
   return Status::OK();
 }
 
 // two qubit fsim -> Create(time, q0, q1, theta, phi)
 inline Status FsimGate(const Operation& op, const SymbolMap& param_map,
                        const unsigned int num_qubits, const unsigned int time,
-                       QsimCircuit* circuit) {
+                       QsimCircuit* circuit,
+                       std::vector<GradientOfGate>* grad_indices) {
   int q0, q1;
   bool unused;
   float theta, theta_s, phi, phi_s;
   Status u;
   unused = absl::SimpleAtoi(op.qubits(0).id(), &q0);
   unused = absl::SimpleAtoi(op.qubits(1).id(), &q1);
-  u = ParseProtoArg(op, "theta", param_map, &theta);
+
+  absl::optional<std::string> theta_symbol;
+  u = ParseProtoArg(op, "theta", param_map, &theta, &theta_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -306,7 +360,8 @@ inline Status FsimGate(const Operation& op, const SymbolMap& param_map,
   if (!u.ok()) {
     return u;
   }
-  u = ParseProtoArg(op, "phi", param_map, &phi);
+  absl::optional<std::string> phi_symbol;
+  u = ParseProtoArg(op, "phi", param_map, &phi, &phi_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -317,13 +372,31 @@ inline Status FsimGate(const Operation& op, const SymbolMap& param_map,
   circuit->gates.push_back(qsim::Cirq::FSimGate<float>::Create(
       time, num_qubits - q0 - 1, num_qubits - q1 - 1, theta * theta_s,
       phi * phi_s));
+
+  // check for symbols and track gradients if needed.
+  if (grad_indices != nullptr &&
+      (theta_symbol.has_value() || phi_symbol.has_value())) {
+    GradientOfGate grad;
+    if (theta_symbol.has_value()) {
+      PopulateGradientFsimTheta(theta_symbol.value(), circuit->gates.size() - 1,
+                                num_qubits - q0 - 1, num_qubits - q1 - 1, theta,
+                                theta_s, phi, phi_s, &grad);
+    }
+    if (phi_symbol.has_value()) {
+      PopulateGradientFsimPhi(phi_symbol.value(), circuit->gates.size() - 1,
+                              num_qubits - q0 - 1, num_qubits - q1 - 1, theta,
+                              theta_s, phi, phi_s, &grad);
+    }
+    grad_indices->push_back(grad);
+  }
   return Status::OK();
 }
 
 // two qubit phase iswap -> Create(time, q0, q1, pexp, exp)
 inline Status PhasedISwapGate(const Operation& op, const SymbolMap& param_map,
                               const unsigned int num_qubits,
-                              const unsigned int time, QsimCircuit* circuit) {
+                              const unsigned int time, QsimCircuit* circuit,
+                              std::vector<GradientOfGate>* grad_indices) {
   int q0, q1;
   bool unused;
   float pexp, pexp_s, exp, exp_s;
@@ -331,7 +404,8 @@ inline Status PhasedISwapGate(const Operation& op, const SymbolMap& param_map,
   unused = absl::SimpleAtoi(op.qubits(0).id(), &q0);
   unused = absl::SimpleAtoi(op.qubits(1).id(), &q1);
 
-  u = ParseProtoArg(op, "exponent", param_map, &exp);
+  absl::optional<std::string> exponent_symbol;
+  u = ParseProtoArg(op, "exponent", param_map, &exp, &exponent_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -339,7 +413,9 @@ inline Status PhasedISwapGate(const Operation& op, const SymbolMap& param_map,
   if (!u.ok()) {
     return u;
   }
-  u = ParseProtoArg(op, "phase_exponent", param_map, &pexp);
+  absl::optional<std::string> phase_exponent_symbol;
+  u = ParseProtoArg(op, "phase_exponent", param_map, &pexp,
+                    &phase_exponent_symbol);
   if (!u.ok()) {
     return u;
   }
@@ -350,19 +426,38 @@ inline Status PhasedISwapGate(const Operation& op, const SymbolMap& param_map,
   circuit->gates.push_back(qsim::Cirq::PhasedISwapPowGate<float>::Create(
       time, num_qubits - q0 - 1, num_qubits - q1 - 1, pexp * pexp_s,
       exp * exp_s));
+
+  // check for symbols and track gradients if needed.
+  if (grad_indices != nullptr &&
+      (exponent_symbol.has_value() || phase_exponent_symbol.has_value())) {
+    GradientOfGate grad;
+    if (exponent_symbol.has_value()) {
+      PopulateGradientPhasedISwapExponent(
+          exponent_symbol.value(), circuit->gates.size() - 1,
+          num_qubits - q0 - 1, num_qubits - q1 - 1, pexp, pexp_s, exp, exp_s,
+          &grad);
+    }
+    if (phase_exponent_symbol.has_value()) {
+      PopulateGradientPhasedISwapPhasedExponent(
+          phase_exponent_symbol.value(), circuit->gates.size() - 1,
+          num_qubits - q0 - 1, num_qubits - q1 - 1, pexp, pexp_s, exp, exp_s,
+          &grad);
+    }
+    grad_indices->push_back(grad);
+  }
   return Status::OK();
 }
 
-tensorflow::Status ParseAppendGate(const Operation& op,
-                                   const SymbolMap& param_map,
-                                   const unsigned int num_qubits,
-                                   const unsigned int time,
-                                   QsimCircuit* circuit) {
+tensorflow::Status ParseAppendGate(
+    const Operation& op, const SymbolMap& param_map,
+    const unsigned int num_qubits, const unsigned int time,
+    QsimCircuit* circuit, std::vector<GradientOfGate>* grad_indices = nullptr) {
   // map gate name -> callable to build that qsim gate from operation proto.
   static const absl::flat_hash_map<
-      std::string, std::function<Status(const Operation&, const SymbolMap&,
-                                        const unsigned int, const unsigned int,
-                                        QsimCircuit*)>>
+      std::string,
+      std::function<Status(const Operation&, const SymbolMap&,
+                           const unsigned int, const unsigned int, QsimCircuit*,
+                           std::vector<GradientOfGate>*)>>
       func_map = {{"I", &IGate},       {"HP", &HGate},
                   {"XP", &XGate},      {"XXP", &XXGate},
                   {"YP", &YGate},      {"YYP", &YYGate},
@@ -377,7 +472,8 @@ tensorflow::Status ParseAppendGate(const Operation& op,
     return Status(tensorflow::error::INVALID_ARGUMENT,
                   "Could not parse gate id: " + op.gate().id());
   }
-  return build_f->second(op, param_map, num_qubits, time, circuit);
+  return build_f->second(op, param_map, num_qubits, time, circuit,
+                         grad_indices);
 }
 
 }  // namespace
@@ -408,6 +504,50 @@ tensorflow::Status QsimCircuitFromProgram(
   // Build fused circuit.
   *fused_circuit = qsim::BasicGateFuser<qsim::IO, QsimGate>().FuseGates(
       circuit->num_qubits, circuit->gates);
+  return Status::OK();
+}
+
+tensorflow::Status QsimCircuitFromProgramADJ(
+    const Program& program, const SymbolMap& param_map, const int num_qubits,
+    QsimCircuit* circuit,
+    std::vector<std::vector<qsim::GateFused<QsimGate>>>* partial_fuses,
+    std::vector<GradientOfGate>* grad_indices) {
+  // Convert proto to qsim internal representation.
+  circuit->num_qubits = num_qubits;
+  int time = 0;
+  // Special case empty.
+  if (num_qubits <= 0) {
+    return Status::OK();
+  }
+
+  circuit->gates.reserve(program.circuit().moments_size() * num_qubits);
+  for (const Moment& moment : program.circuit().moments()) {
+    for (const Operation& op : moment.operations()) {
+      Status status = ParseAppendGate(op, param_map, num_qubits, time, circuit,
+                                      grad_indices);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    time++;
+  }
+
+  auto fuser = qsim::BasicGateFuser<qsim::IO, QsimGate>();
+  auto left = circuit->gates.begin();
+  auto right = left;
+
+  partial_fuses->assign(grad_indices->size() + 1,
+                        std::vector<qsim::GateFused<QsimGate>>({}));
+  for (int i = 0; i < grad_indices->size(); i++) {
+    right = circuit->gates.begin() + (*grad_indices)[i].index;
+    std::cout << "Found grad gate on index:" << (*grad_indices)[i].index << std::endl;
+    (*partial_fuses)[i] = fuser.FuseGates(circuit->num_qubits, left, right);
+    left = right + 1;
+  }
+  right = circuit->gates.end();
+  (*partial_fuses)[grad_indices->size()] =
+      fuser.FuseGates(circuit->num_qubits, left, right);
+
   return Status::OK();
 }
 

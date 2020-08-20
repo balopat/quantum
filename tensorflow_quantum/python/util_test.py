@@ -78,6 +78,19 @@ class UtilFunctionsTest(tf.test.TestCase, parameterized.TestCase):
         flat_expected = np.array([_single_to_tensor(x) for x in flat])
         self.assertAllEqual(flat_actual, flat_expected)
 
+    # def test_speed_test(self):
+    #     qbs = cirq.GridQubit.rect(1,25)
+    #     import time
+        
+    #     big_thing = util.random_symbol_circuit(qbs, ['alpha', 'beta', 'gamma'], n_moments=20)
+    #     t = time.time()
+    #     xx = util.convert_to_tensor([big_thing, big_thing, big_thing])
+    #     t2 = time.time()
+    #     print("-"*80)
+    #     print(cirq.to_json(big_thing))
+    #     print('TIME diff', t2 - t)
+    #     self.assertEqual(1, 2)
+
     def test_convert_to_tensor_errors(self):
         """Test that convert_to_tensor fails when it should."""
         with self.assertRaisesRegex(TypeError, expected_regex="Incompatible"):
